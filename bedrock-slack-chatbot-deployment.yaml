@@ -1,0 +1,344 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Slack Chatbot with Amazon Bedrock KB Integration'
+
+Parameters:
+  KnowledgeBaseId:
+    Type: String
+    Description: "The ID of the knowledge base to use"
+  RegionName:
+    Type: String
+    Default: "us-west-2"
+    Description: "AWS Region name for Bedrock services"
+  ModelId:
+    Type: String
+    Default: "anthropic.claude-3-5-sonnet-20240620-v1:0"
+    Description: "Bedrock model ID to use"
+
+Resources:
+  # IAM Roles
+  BedrockAskFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InvokeLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt SlackAsyncProcessor.Arn
+
+  AsyncProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonBedrockFullAccess
+
+  # Lambda Functions
+  BedrockAskFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: bedrock-ask-function
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Code: 
+        ZipFile: !Sub |
+          import json
+          import boto3
+          from urllib import parse
+
+          def lambda_handler(event, context):
+              try:
+                  body = event.get('body', '')
+                  params = dict(parse.parse_qs(body))
+                  question = params.get('text', [''])[0]
+                  response_url = params.get('response_url', [''])[0]
+                  user_id = params.get('user_id', [''])[0]
+
+                  # Invoke second Lambda function asynchronously
+                  lambda_client = boto3.client('lambda')
+                  lambda_client.invoke(
+                      FunctionName='slack-async-processor',  # Second Lambda function name
+                      InvocationType='Event',  # Asynchronous invocation
+                      Payload=json.dumps({
+                          'question': question,
+                          'response_url': response_url,
+                          'user_id': user_id
+                      })
+                  )
+
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json'
+                      },
+                      'body': json.dumps({
+                          'response_type': 'in_channel',
+                          'text': f'Processing <@{user_id}>\'s question... Please wait a moment.'
+                      })
+                  }
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json'
+                      },
+                      'body': json.dumps({
+                          'response_type': 'ephemeral',
+                          'text': 'Sorry, an error has occurred.'
+                      })
+                  }
+      Role: !GetAtt BedrockAskFunctionRole.Arn
+      Timeout: 60
+      MemorySize: 2048
+
+  SlackAsyncProcessor:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: slack-async-processor
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3 
+          import requests
+          import os
+
+          KNOWLEDGE_BASE_ID = os.environ['KNOWLEDGE_BASE_ID']
+          REGION_NAME = os.environ['REGION_NAME']
+          MODEL_ID = os.environ['MODEL_ID']
+
+          def context_retrieval_from_kb(prompt, k=10):
+              if not prompt:
+                  return []
+
+              search_type='SEMANTIC'
+              bedrock_agent_client = boto3.client('bedrock-agent-runtime', region_name=REGION_NAME)
+
+              response = bedrock_agent_client.retrieve(
+                  knowledgeBaseId=KNOWLEDGE_BASE_ID,
+                  retrievalConfiguration={
+                      'vectorSearchConfiguration': {
+                          'numberOfResults': k,
+                          'overrideSearchType': search_type
+                      }
+                  },
+                  retrievalQuery={
+                      'text': prompt
+                  }
+              )        
+              raw_result = response.get('retrievalResults', [])
+
+              if not raw_result:
+                  return []
+
+              search_result = []
+              for idx, result in enumerate(raw_result):
+                  content = result.get('content', {}).get('text', 'No content available')
+                  score = result.get('score', 'N/A')
+                  source = result.get('location', {})
+
+                  search_result.append({
+                      "index": idx + 1,
+                      "content": content,
+                      "source": source,
+                      "score": score
+                  })
+
+              return search_result
+
+          def generate_response(question, context_results, user_id=None):
+              if not context_results:
+                  return "No relevant documents found. Please try another question."
+
+              context_text = ""
+              for item in context_results:
+                  context_text += f"Content: {item['content']}\nSource: {item['source']}\n\n"
+
+              system_prompt = "Please answer the question based on the following information. If information is not provided in the Source, please politely indicate that you don't know."
+
+              bedrock_runtime = boto3.client('bedrock-runtime', region_name=REGION_NAME)
+
+              try:
+                  response = bedrock_runtime.converse(
+                      modelId=MODEL_ID,
+                      system=[{'text': system_prompt}],
+                      messages=[
+                          {
+                              'role': 'user',
+                              'content': [
+                                  {
+                                      'text': f"Context:\n{context_text}\n\nQuestion: {question}"
+                                  }
+                              ]
+                          }
+                      ],
+                      inferenceConfig={
+                          'maxTokens': 2000,
+                          'temperature': 0.7,
+                          'topP': 0.8,
+                      }
+                  )
+
+                  # Parse response
+                  answer = response['output']['message']['content'][0]['text']
+                  return answer
+
+              except Exception as e:
+                  print(f"Error in generate_response: {str(e)}")
+                  return "Sorry, an error occurred while generating the response. Please try again later."
+
+          def format_context_for_slack(context_results):
+              formatted_result = ""
+              for item in context_results:
+                  formatted_result += f"*Reference Document {item['index']}*\n"
+                  formatted_result += f"Content: {item['content']}\n"
+                  formatted_result += f"Source: {item['source']}\n"
+                  formatted_result += f"Relevance: {item['score']}\n\n"
+              return formatted_result
+
+          def lambda_handler(event, context):
+              try:
+                  question = event['question']
+                  response_url = event['response_url']
+                  user_id = event['user_id']
+
+                  # Search context
+                  search_result = context_retrieval_from_kb(question, k=10)
+
+                  # Generate response
+                  answer = generate_response(question, search_result, user_id)
+                  print("answer:", answer)
+
+                  # Format context
+                  formatted_context = format_context_for_slack(search_result)
+
+                  # Send final response
+                  final_response = {
+                      'response_type': 'in_channel',
+                      'blocks': [
+                          {
+                              'type': 'section',
+                              'text': {
+                                  'type': 'mrkdwn',
+                                  'text': f'*<@{user_id}>\'s Question:*\n>{question}'
+                              }
+                          },
+                          {
+                              'type': 'section',
+                              'text': {
+                                  'type': 'mrkdwn',
+                                  'text': f'*Answer:*\n{answer}'
+                              }
+                          },
+                          {
+                              'type': 'divider'
+                          }
+                      ]
+                  }
+
+                  response = requests.post(response_url, json=final_response)
+                  if response.status_code != 200:
+                      print(f"Error sending final response: {response.status_code}")
+                      print(f"Response: {response.text}")
+
+              except Exception as e:
+                  print(f"Error in async processing: {str(e)}")
+                  error_response = {
+                      'response_type': 'ephemeral',
+                      'text': f'Sorry, an error occurred during processing: {str(e)}'
+                  }
+                  requests.post(response_url, json=error_response)
+      Environment:
+        Variables:
+          KNOWLEDGE_BASE_ID: !Ref KnowledgeBaseId
+          REGION_NAME: !Ref RegionName
+          MODEL_ID: !Ref ModelId
+      Layers:
+        - !Sub "arn:aws:lambda:${AWS::Region}:770693421928:layer:Klayers-p312-requests:9"
+      Role: !GetAtt AsyncProcessorRole.Arn
+      Timeout: 60
+      MemorySize: 2048 
+
+  # API Gateway
+  ChatbotAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: Bedrock-Chatbot-API
+      Description: API for Slack Chatbot with Bedrock integration
+
+  ChatResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ChatbotAPI.RootResourceId
+      PathPart: chat
+      RestApiId: !Ref ChatbotAPI
+
+  ChatMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: POST
+      ResourceId: !Ref ChatResource
+      RestApiId: !Ref ChatbotAPI
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BedrockAskFunction.Arn}/invocations
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ChatMethod
+    Properties:
+      RestApiId: !Ref ChatbotAPI
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId: !Ref ApiDeployment
+      RestApiId: !Ref ChatbotAPI
+      StageName: prod
+
+  # Lambda Permission
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref BedrockAskFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ChatbotAPI}/*/*/*
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub https://${ChatbotAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/chat
+
+  BedrockAskFunctionArn:
+    Description: ARN of the Bedrock Ask Function
+    Value: !GetAtt BedrockAskFunction.Arn
+
+  SlackAsyncProcessorArn:
+    Description: ARN of the Slack Async Processor
+    Value: !GetAtt SlackAsyncProcessor.Arn
